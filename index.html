@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>My Daily Tasks</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- PWA manifest -->
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#020617" />
+  <!-- iOS support -->
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <style>
+    /* (STYLE BLOCK UNCHANGED FROM PREVIOUS ANSWER – KEEP EVERYTHING YOU ALREADY HAVE) */
+    /* For brevity, I’ll omit the CSS here; reuse the exact <style> from the previous file. */
+  </style>
+</head>
+<body>
+<div class="app-shell">
+  <div class="app-inner">
+    <!-- (HEADER, QUICK CAPTURE, LAYOUT, FOOTER, TOAST – UNCHANGED HTML BODY from your previous version) -->
+    <!-- Paste the same HTML structure you already have here. To save space, I’m not repeating it all. -->
+  </div>
+</div>
+
+<div class="toast" id="toast">
+  <span class="icon">✨</span>
+  <span id="toastMsg">Saved to Inbox</span>
+</div>
+
+<script>
+  // --- CONFIG FOR CLOUD SYNC -------------------------------------------
+  // Set this to your backend URL when you deploy e.g. https://your-domain.com
+  const API_BASE = "https://your-sync-server.example.com"; // change this
+  const SYNC_ENABLED = !!API_BASE; // simple flag
+  const SYNC_INTERVAL_MS = 60_000;  // auto-sync every 60s
+  const DEVICE_ID_KEY = "daily-tasks-device-id";
+
+  function getDeviceId() {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (!id) {
+      id = "dev_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem(DEVICE_ID_KEY, id);
+    }
+    return id;
+  }
+  const DEVICE_ID = getDeviceId();
+
+  // --- Storage helpers -------------------------------------------------
+  const STORAGE_KEY = "daily-tasks-v1";
+  const SETTINGS_KEY = "daily-tasks-settings-v1";
+
+  function loadTasks() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed;
+    } catch (e) {
+      console.error("Failed to load tasks", e);
+      return [];
+    }
+  }
+
+  function saveTasks(tasks) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+      // mark latest local change for sync
+      settings.lastLocalChangeAt = Date.now();
+      saveSettings(settings);
+    } catch (e) {
+      console.error("Failed to save tasks", e);
+    }
+  }
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return {};
+      return JSON.parse(raw) || {};
+    } catch (e) {
+      console.error("Failed to load settings", e);
+      return {};
+    }
+  }
+
+  function saveSettings(settings) {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch (e) {
+      console.error("Failed to save settings", e);
+    }
+  }
+
+  // --- State -----------------------------------------------------------
+  let tasks = loadTasks();
+  let settings = loadSettings();
+  let currentView = "today";
+  let currentProjectFilter = "";
+
+  // --- Util ------------------------------------------------------------
+  function generateId() {
+    return "t_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+
+  function todayISO() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.toISOString().slice(0, 10);
+  }
+
+  function isSameDate(dateStr, isoStr) {
+    if (!dateStr || !isoStr) return false;
+    return dateStr === isoStr;
+  }
+
+  function isBeforeToday(dateStr) {
+    if (!dateStr) return false;
+    const t = new Date(todayISO());
+    const d = new Date(dateStr);
+    return d < t;
+  }
+
+  function showToast(message) {
+    const toast = document.getElementById("toast");
+    const toastMsg = document.getElementById("toastMsg");
+    toastMsg.textContent = message;
+    toast.classList.add("visible");
+    setTimeout(() => {
+      toast.classList.remove("visible");
+    }, 2000);
+  }
+
+  // --- CLOUD SYNC ------------------------------------------------------
+  async function syncWithCloud({forceFull = false} = {}) {
+    if (!SYNC_ENABLED || !API_BASE) return;
+
+    try {
+      const lastSyncAt = settings.lastSyncAt || 0;
+      const payload = {
+        deviceId: DEVICE_ID,
+        lastSyncAt,
+        forceFull,
+        tasks
+      };
+      const res = await fetch(API_BASE + "/api/tasks/sync", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        console.warn("Sync failed", res.status);
+        return;
+      }
+      const data = await res.json();
+      if (!data || !Array.isArray(data.tasks)) return;
+
+      // Simple "last-writer-wins" merge by id + updatedAt
+      const remoteTasks = data.tasks;
+      const merged = mergeTasks(tasks, remoteTasks);
+      tasks = merged;
+      saveTasks(tasks);
+      settings.lastSyncAt = Date.now();
+      saveSettings(settings);
+      render();
+      if (data.message) {
+        console.log("Sync:", data.message);
+      } else {
+        console.log("Sync complete");
+      }
+    } catch (err) {
+      console.error("Sync error", err);
+    }
+  }
+
+  function mergeTasks(localTasks, remoteTasks) {
+    const map = new Map();
+
+    function put(t) {
+      if (!t.id) return;
+      const existing = map.get(t.id);
+      const localUpdated = existing ? (existing.updatedAt || 0) : 0;
+      const newUpdated = t.updatedAt || 0;
+      if (!existing || newUpdated >= localUpdated) {
+        map.set(t.id, t);
+      }
+    }
+
+    localTasks.forEach(put);
+    remoteTasks.forEach(put);
+
+    return Array.from(map.values());
+  }
+
+  function scheduleAutoSync() {
+    if (!SYNC_ENABLED) return;
+    setInterval(() => {
+      syncWithCloud();
+    }, SYNC_INTERVAL_MS);
+  }
+
+  window.addEventListener("online", () => {
+    if (SYNC_ENABLED) {
+      syncWithCloud({forceFull: false});
+      showToast("Back online. Syncing.");
+    }
+  });
+
+  // --- Rendering (same as before) -------------------------------------
+  function render() {
+    renderTasks();
+    updateStats();
+    updateTabCounts();
+  }
+
+  function filteredTasks() {
+    return tasks.filter((t) => {
+      if (currentProjectFilter && t.project !== currentProjectFilter) {
+        return false;
+      }
+      const today = todayISO();
+      if (currentView === "today") {
+        if (t.completed) return false;
+        if (!t.dueDate) return true;
+        return isSameDate(t.dueDate, today);
+      }
+      if (currentView === "inbox") {
+        return !t.completed && t.inboxOnly;
+      }
+      if (currentView === "upcoming") {
+        if (t.completed) return false;
+        if (!t.dueDate) return false;
+        const due = new Date(t.dueDate);
+        const now = new Date(today);
+        return due >= now && !isSameDate(t.dueDate, today);
+      }
+      if (currentView === "completed") {
+        return t.completed;
+      }
+      return true;
+    });
+  }
+
+  function updateTabCounts() {
+    const today = todayISO();
+    const todayCount = tasks.filter((t) => !t.completed && (!t.dueDate || isSameDate(t.dueDate, today))).length;
+    const inboxCount = tasks.filter((t) => !t.completed && t.inboxOnly).length;
+    const upcomingCount = tasks.filter((t) => {
+      if (t.completed) return false;
+      if (!t.dueDate) return false;
+      const due = new Date(t.dueDate);
+      const now = new Date(today);
+      return due > now;
+    }).length;
+    const doneCount = tasks.filter((t) => t.completed).length;
+
+    document.getElementById("countToday").textContent = todayCount;
+    document.getElementById("countInbox").textContent = inboxCount;
+    document.getElementById("countUpcoming").textContent = upcomingCount;
+    document.getElementById("countCompleted").textContent = doneCount;
+  }
+
+  function updateStats() {
+    const today = todayISO();
+    const todayTasks = tasks.filter((t) => !t.completed && (t.dueDate ? isSameDate(t.dueDate, today) : true));
+    const focusTasks = tasks.filter((t) => !t.completed && t.priority === "high");
+    const overdueTasks = tasks.filter((t) => !t.completed && t.dueDate && isBeforeToday(t.dueDate));
+
+    document.getElementById("statTodayCount").textContent = todayTasks.length;
+    document.getElementById("statFocusCount").textContent = focusTasks.length;
+    document.getElementById("statOverdueCount").textContent = overdueTasks.length;
+
+    const statTodaySub = document.getElementById("statTodaySub");
+    if (todayTasks.length === 0) {
+      statTodaySub.textContent = "Nothing scheduled yet.";
+    } else if (todayTasks.length <= 3) {
+      statTodaySub.textContent = "Nice and focused.";
+    } else {
+      statTodaySub.textContent = "Try to pick your top 3.";
+    }
+
+    const nudgeText = document.getElementById("nudgeText");
+    if (overdueTasks.length > 0) {
+      nudgeText.textContent = "You have overdue tasks. Start by picking one small one to complete now.";
+    } else if (focusTasks.length > 0) {
+      nudgeText.textContent = "You have high‑priority tasks waiting. Block 25 minutes and handle one.";
+    } else {
+      nudgeText.textContent = "When something pops into your head, toss it into Inbox immediately. Decide later if it’s actually important.";
+    }
+  }
+
+  function renderTasks() {
+    const list = document.getElementById("taskList");
+    list.innerHTML = "";
+    const viewTasks = filteredTasks();
+
+    if (viewTasks.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "task-list-empty";
+      if (currentView === "today") {
+        empty.innerHTML = "No tasks for today yet.<br><span class='hint'>Use quick capture, then assign a date.</span>";
+      } else if (currentView === "inbox") {
+        empty.innerHTML = "Inbox is empty.<br><span class='hint'>Throw in anything that’s on your mind.</span>";
+      } else if (currentView === "upcoming") {
+        empty.innerHTML = "No upcoming tasks yet.<br><span class='hint'>Add due dates to see them here.</span>";
+      } else {
+        empty.innerHTML = "No completed tasks yet.<br><span class='hint'>Check off tasks to see them here.</span>";
+      }
+      list.appendChild(empty);
+      return;
+    }
+
+    viewTasks.forEach((task) => {
+      const li = document.createElement("li");
+      li.className = "task-row";
+      const overdue = task.dueDate && isBeforeToday(task.dueDate) && !task.completed;
+      if (overdue) li.classList.add("overdue");
+      if (task.completed) li.classList.add("task-completed");
+      if (task.inboxOnly) li.classList.add("inbox-only");
+
+      const checkboxWrap = document.createElement("div");
+      checkboxWrap.className = "checkbox-wrap";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "task-checkbox";
+      checkbox.checked = !!task.completed;
+      checkbox.addEventListener("change", () => {
+        task.completed = checkbox.checked;
+        task.updatedAt = Date.now();
+        task.lastUpdatedBy = DEVICE_ID;
+        saveTasks(tasks);
+        render();
+        showToast(task.completed ? "Nice. Task completed." : "Task re‑opened.");
+        syncWithCloud();
+      });
+      checkboxWrap.appendChild(checkbox);
+
+      const main = document.createElement("div");
+      main.className = "task-main";
+
+      const titleRow = document.createElement("div");
+      titleRow.className = "task-title-row";
+
+      const title = document.createElement("div");
+      title.className = "task-title" + (task.completed ? " completed" : "");
+      title.textContent = task.title || "(No title)";
+      title.addEventListener("dblclick", () => startInlineEdit(task, title));
+
+      const tags = document.createElement("div");
+      tags.className = "task-tags";
+
+      if (task.project) {
+        const projTag = document.createElement("span");
+        projTag.className = "tag tag-project";
+        projTag.textContent = task.project;
+        tags.appendChild(projTag);
+      }
+      if (task.inboxOnly && !task.completed) {
+        const inboxTag = document.createElement("span");
+        inboxTag.className = "tag tag-inbox";
+        inboxTag.textContent = "Inbox";
+        tags.appendChild(inboxTag);
+      }
+      if (!task.inboxOnly && !task.completed) {
+        const priorityTag = document.createElement("span");
+        let cls = "tag";
+        if (task.priority === "high") cls += " tag-priority-high";
+        else if (task.priority === "low") cls += " tag-priority-low";
+        else cls += " tag-priority-med";
+        priorityTag.className = cls;
+        priorityTag.textContent = (task.priority || "medium").toUpperCase();
+        tags.appendChild(priorityTag);
+      }
+
+      titleRow.appendChild(title);
+      titleRow.appendChild(tags);
+
+      const metaRow = document.createElement("div");
+      metaRow.className = "task-meta-row";
+
+      if (task.dueDate) {
+        const duePill = document.createElement("span");
+        duePill.className = "task-meta-pill" + (overdue ? " overdue" : "");
+        const icon = document.createElement("span");
+        icon.className = "icon";
+        icon.textContent = overdue ? "⏱️" : "📅";
+        const text = document.createElement("span");
+        text.textContent = overdue ? "Overdue · " + task.dueDate : "Due · " + task.dueDate;
+        duePill.appendChild(icon);
+        duePill.appendChild(text);
+        metaRow.appendChild(duePill);
+      } else if (!task.inboxOnly && !task.completed) {
+        const hintPill = document.createElement("span");
+        hintPill.className = "task-meta-pill";
+        const icon = document.createElement("span");
+        icon.className = "icon";
+        icon.textContent = "📌";
+        const text = document.createElement("span");
+        text.textContent = "No date yet";
+        hintPill.appendChild(icon);
+        hintPill.appendChild(text);
+        metaRow.appendChild(hintPill);
+      }
+
+      if (task.createdAt) {
+        const createdPill = document.createElement("span");
+        createdPill.className = "task-meta-pill";
+        const icon = document.createElement("span");
+        icon.className = "icon";
+        icon.textContent = "🕒";
+        const text = document.createElement("span");
+        text.textContent = "Captured " + new Date(task.createdAt).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+        createdPill.appendChild(icon);
+        createdPill.appendChild(text);
+        metaRow.appendChild(createdPill);
+      }
+
+      main.appendChild(titleRow);
+      main.appendChild(metaRow);
+
+      const actions = document.createElement("div");
+      actions.className = "task-actions";
+
+      const promoteBtn = document.createElement("button");
+      promoteBtn.innerHTML = "<span>⬆️</span><span>Promote</span>";
+      promoteBtn.addEventListener("click", () => {
+        task.inboxOnly = false;
+        if (!task.dueDate) {
+          task.dueDate = todayISO();
+        }
+        task.updatedAt = Date.now();
+        task.lastUpdatedBy = DEVICE_ID;
+        saveTasks(tasks);
+        render();
+        showToast("Task promoted out of Inbox.");
+        syncWithCloud();
+      });
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.className = "delete";
+      deleteBtn.innerHTML = "<span>🗑</span><span>Remove</span>";
+      deleteBtn.addEventListener("click", () => {
+        if (!confirm("Delete this task?")) return;
+        tasks = tasks.filter((t) => t.id !== task.id);
+        saveTasks(tasks);
+        render();
+        showToast("Task deleted.");
+        syncWithCloud();
+      });
+
+      if (!task.completed) {
+        actions.appendChild(promoteBtn);
+      }
+      actions.appendChild(deleteBtn);
+
+      li.appendChild(checkboxWrap);
+      li.appendChild(main);
+      li.appendChild(actions);
+
+      list.appendChild(li);
+    });
+  }
+
+  function startInlineEdit(task, titleEl) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = task.title;
+    input.className = "quick-input";
+    input.style.fontSize = "0.9rem";
+    input.style.padding = "3px 8px";
+    input.style.borderRadius = "8px";
+    titleEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    const finish = (save) => {
+      if (save) {
+        task.title = input.value.trim() || "(No title)";
+        task.updatedAt = Date.now();
+        task.lastUpdatedBy = DEVICE_ID;
+        saveTasks(tasks);
+        syncWithCloud();
+      }
+      render();
+    };
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") finish(true);
+      if (e.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
+
+  // --- Quick capture (slight update to add updatedAt & lastUpdatedBy) ---
+  const quickInput = document.getElementById("quickInput");
+  const quickDueDate = document.getElementById("quickDueDate");
+  const quickPriority = document.getElementById("quickPriority");
+  const quickProject = document.getElementById("quickProject");
+  const quickInboxOnly = document.getElementById("quickInboxOnly");
+  const quickAddBtn = document.getElementById("quickAddBtn");
+
+  function addQuickTask() {
+    const title = quickInput.value.trim();
+    if (!title) {
+      quickInput.focus();
+      return;
+    }
+    const now = Date.now();
+    const task = {
+      id: generateId(),
+      title,
+      project: quickProject.value || "",
+      priority: quickPriority.value || "medium",
+      dueDate: quickDueDate.value || "",
+      inboxOnly: !!quickInboxOnly.checked,
+      completed: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: now,
+      lastUpdatedBy: DEVICE_ID
+    };
+    tasks.unshift(task);
+    saveTasks(tasks);
+    quickInput.value = "";
+    quickDueDate.value = "";
+    quickPriority.value = "medium";
+    render();
+    showToast("Captured to " + (task.inboxOnly ? "Inbox." : "Today list."));
+    syncWithCloud();
+  }
+
+  quickAddBtn.addEventListener("click", addQuickTask);
+  quickInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      addQuickTask();
+    }
+  });
+
+  // --- View switching, nudges, keyboard shortcuts (same as before) -----
+  const tabs = document.querySelectorAll(".tab");
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const view = tab.dataset.view;
+      switchView(view);
+    });
+  });
+
+  function switchView(view) {
+    if (!view) return;
+    currentView = view;
+    tabs.forEach((tab) => {
+      tab.classList.toggle("tab-active", tab.dataset.view === view);
+    });
+    render();
+  }
+
+  document.getElementById("filterProject").addEventListener("change", (e) => {
+    currentProjectFilter = e.target.value || "";
+    render();
+  });
+
+  document.getElementById("clearCompletedBtn").addEventListener("click", () => {
+    if (!tasks.some((t) => t.completed)) {
+      showToast("No completed tasks to clear.");
+      return;
+    }
+    if (!confirm("Clear all completed tasks?")) return;
+    tasks = tasks.filter((t) => !t.completed);
+    saveTasks(tasks);
+    render();
+    showToast("Completed tasks cleared.");
+    syncWithCloud();
+  });
+
+  document.getElementById("todayViewBtn").addEventListener("click", () => switchView("today"));
+  document.getElementById("inboxViewBtn").addEventListener("click", () => {
+    switchView("inbox");
+    document.getElementById("taskList").scrollTop = 0;
+  });
+
+  const nudgeDailyCheckbox = document.getElementById("nudgeDailyCheckbox");
+  nudgeDailyCheckbox.checked = !!settings.dailyNudge;
+  nudgeDailyCheckbox.addEventListener("change", () => {
+    settings.dailyNudge = nudgeDailyCheckbox.checked;
+    saveSettings(settings);
+    if (settings.dailyNudge) {
+      showToast("Daily nudge enabled.");
+    } else {
+      showToast("Daily nudge disabled.");
+    }
+  });
+
+  document.getElementById("nudgeReviewTodayBtn").addEventListener("click", () => {
+    switchView("today");
+    showToast("Review Today list.");
+  });
+
+  document.getElementById("nudgeProcessInboxBtn").addEventListener("click", () => {
+    switchView("inbox");
+    showToast("Process your Inbox.");
+  });
+
+  function maybeShowDailyNudge() {
+    if (!settings.dailyNudge) return;
+    const today = todayISO();
+    if (settings.lastNudgeDate === today) return;
+    settings.lastNudgeDate = today;
+    saveSettings(settings);
+    showToast("Two‑minute review: Today + Inbox.");
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable)) {
+      return;
+    }
+    if (e.key === "q" || e.key === "Q") {
+      e.preventDefault();
+      quickInput.focus();
+      quickInput.select();
+    }
+    if (e.key === "1") switchView("today");
+    if (e.key === "2") switchView("inbox");
+    if (e.key === "3") switchView("upcoming");
+    if (e.key === "4") switchView("completed");
+  });
+
+  // --- PWA: service worker registration --------------------------------
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("service-worker.js")
+        .then(() => console.log("Service worker registered"))
+        .catch((err) => console.error("SW registration failed", err));
+    });
+  }
+
+  // --- Init ------------------------------------------------------------
+  render();
+  maybeShowDailyNudge();
+  scheduleAutoSync();
+  // Optionally, initial sync on load
+  syncWithCloud({forceFull: true});
+</script>
+</body>
+</html>
